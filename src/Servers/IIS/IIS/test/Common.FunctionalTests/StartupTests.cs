@@ -182,7 +182,7 @@ namespace Microsoft.AspNetCore.Server.IIS.FunctionalTests
 
         public static TestMatrix TestVariants
             => TestMatrix.ForServers(DeployerSelector.ServerType)
-                .WithTfms(Tfm.Net50)
+                .WithTfms(Tfm.Default)
                 .WithAllApplicationTypes()
                 .WithAncmV2InProcess();
 
@@ -1003,6 +1003,9 @@ namespace Microsoft.AspNetCore.Server.IIS.FunctionalTests
             var deploymentResult = await DeployAsync(deploymentParameters);
 
             await AssertFailsToStart(deploymentResult);
+            
+            StopServer();
+
             var expectedString = new string('a', 30000);
             Assert.Contains(TestSink.Writes, context => context.Message.Contains(expectedString));
             EventLogHelpers.VerifyEventLogEvent(deploymentResult, EventLogHelpers.InProcessThreadExitStdOut(deploymentResult, "12", expectedString), Logger);
