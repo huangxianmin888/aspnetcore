@@ -12,9 +12,12 @@ using Microsoft.AspNetCore.Mvc.ActionConstraints;
 using Microsoft.AspNetCore.Mvc.Controllers;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Internal;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.AspNetCore.Mvc.Routing
 {
@@ -22,8 +25,10 @@ namespace Microsoft.AspNetCore.Mvc.Routing
     {
         private readonly RoutePatternTransformer _routePatternTransformer;
         private readonly RequestDelegate _requestDelegate;
+        private readonly IValueProviderFactory[] _valueProviderFactories;
+        private readonly int _maxModelValidationErrors;
 
-        public ActionEndpointFactory(RoutePatternTransformer routePatternTransformer)
+        internal ActionEndpointFactory(RoutePatternTransformer routePatternTransformer)
         {
             if (routePatternTransformer == null)
             {
@@ -32,6 +37,13 @@ namespace Microsoft.AspNetCore.Mvc.Routing
 
             _routePatternTransformer = routePatternTransformer;
             _requestDelegate = CreateRequestDelegate();
+        }
+
+        public ActionEndpointFactory(RoutePatternTransformer routePatternTransformer, IOptions<MvcOptions> optionsAccessor)
+            : this(routePatternTransformer)
+        {
+            _valueProviderFactories = optionsAccessor.Value.ValueProviderFactories.ToArray();
+            _maxModelValidationErrors = optionsAccessor.Value.MaxModelValidationErrors;
         }
 
         public void AddEndpoints(
@@ -400,7 +412,7 @@ namespace Microsoft.AspNetCore.Mvc.Routing
             }
         }
 
-        private static RequestDelegate CreateRequestDelegate(ActionDescriptor action, RouteValueDictionary dataTokens = null)
+        private RequestDelegate CreateRequestDelegate(ActionDescriptor action, RouteValueDictionary dataTokens = null)
         {
             // Super happy path (well assuming nobody cares about filters :O)
             if (action is ControllerActionDescriptor ca && ca.FilterDescriptors.Any(a => a.Filter is IApiBehaviorMetadata))
@@ -425,9 +437,12 @@ namespace Microsoft.AspNetCore.Mvc.Routing
                     {
                         // Allocation :(
                         // PERF: These are rarely going to be changed, so let's go copy-on-write.
-                        // ValueProviderFactories = new CopyOnWriteList<IValueProviderFactory>(_valueProviderFactories)
+                        ValueProviderFactories = new CopyOnWriteList<IValueProviderFactory>(_valueProviderFactories),
+                        ModelState =
+                        {
+                            MaxAllowedErrors = _maxModelValidationErrors
+                        }
                     };
-                    // controllerContext.ModelState.MaxAllowedErrors = _maxModelValidationErrors;
 
                     if (cache == null)
                     {
@@ -443,14 +458,23 @@ namespace Microsoft.AspNetCore.Mvc.Routing
 
                     var controller = cacheEntry.ControllerFactory(controllerContext);
 
-                    if (cacheEntry.ControllerBinderDelegate != null)
-                    {
-                        await cacheEntry.ControllerBinderDelegate(controllerContext, controller, null);
-                    }
-
                     try
                     {
-                        var result = await cacheEntry.ActionMethodExecutor.Execute(mapper, cacheEntry.ObjectMethodExecutor, controller, null);
+                        Dictionary<string, object> arguments = null;
+
+                        if (action.BoundProperties.Count > 0 ||
+                            action.Parameters.Count > 0)
+                        {
+                            // Allocation :(
+                            arguments = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+                            //Debug.Assert(cacheEntry.ControllerBinderDelegate != null);
+                            await cacheEntry.ControllerBinderDelegate(controllerContext, controller, arguments);
+                        }
+
+                        var orderedArguments = PrepareArguments(arguments, cacheEntry.ObjectMethodExecutor);
+
+                        var result = await cacheEntry.ActionMethodExecutor.Execute(mapper, cacheEntry.ObjectMethodExecutor, controller, orderedArguments);
 
                         await result.ExecuteResultAsync(actionContext);
                     }
@@ -461,6 +485,38 @@ namespace Microsoft.AspNetCore.Mvc.Routing
                 };
             }
             return null;
+        }
+
+        private static object[] PrepareArguments(
+            IDictionary<string, object> actionParameters,
+            ObjectMethodExecutor actionMethodExecutor)
+        {
+            if (actionParameters is null)
+            {
+                return null;
+            }
+
+            var declaredParameterInfos = actionMethodExecutor.MethodParameters;
+            var count = declaredParameterInfos.Length;
+            if (count == 0)
+            {
+                return null;
+            }
+
+            var arguments = new object[count];
+            for (var index = 0; index < count; index++)
+            {
+                var parameterInfo = declaredParameterInfos[index];
+
+                if (!actionParameters.TryGetValue(parameterInfo.Name, out var value))
+                {
+                    value = actionMethodExecutor.GetDefaultValueForParameter(index);
+                }
+
+                arguments[index] = value;
+            }
+
+            return arguments;
         }
 
         private static RequestDelegate CreateRequestDelegate()
